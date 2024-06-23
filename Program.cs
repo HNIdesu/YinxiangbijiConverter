@@ -1,4 +1,6 @@
-﻿using System.Security.Cryptography;
+﻿using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Security.Cryptography;
 using System.Text;
 using System.Xml;
 namespace YinxiangbijiConverter
@@ -63,7 +65,6 @@ namespace YinxiangbijiConverter
 
         public static void Main(string[] args)
         {
-            
             if (args.Length == 0)
             {
                 var program = Path.GetFileName(Environment.ProcessPath)!;
@@ -77,36 +78,53 @@ namespace YinxiangbijiConverter
                 Console.WriteLine($"file \"{path}\" not exist");
                 return;
             }
+            var sw = Stopwatch.StartNew();
             var doc = new XmlDocument();
+            Console.WriteLine("loading " + path);
             doc.Load(File.OpenRead(path));
-            var noteList = doc.DocumentElement.GetElementsByTagName("note");
+            var noteList = doc.DocumentElement?.GetElementsByTagName("note");
+            if (noteList == null) return;
             int totalCount = noteList.Count;
-            int count = 0;
-            foreach(XmlNode note in noteList)
+            Console.WriteLine($"{totalCount} notes found");
+            var decryptResultDict = new ConcurrentDictionary<XmlElement, string>();
+            Console.WriteLine("starting decryping");
+            Parallel.For(0, totalCount, i =>
             {
-                var content = (XmlElement)((XmlElement)note).GetElementsByTagName("content")[0];
-                var contentEncoding = content.GetAttribute("encoding");
+                var note = noteList[i] as XmlElement;
+                var title = (note?.GetElementsByTagName("title")[0] as XmlElement)?.InnerText;
+                var content = note?.GetElementsByTagName("content")[0] as XmlElement;
+                var contentEncoding = content?.GetAttribute("encoding");
+                if (content == null) return;
                 if (contentEncoding == "base64:aes")
                 {
                     var contentData = Convert.FromBase64String(content.InnerText);
                     try
                     {
-                        var decryptedData=DecryptNote(contentData);
-                        content.RemoveAttribute("encoding");
-                        
-                        content.InnerXml = $"<![CDATA[{Encoding.UTF8.GetString(new ReadOnlySpan<byte>(decryptedData, 0, decryptedData.Length - 1))}]]>";//Length - 1是为了移除最后一个空字符
-                        count++;
+                        var decryptedData = DecryptNote(contentData);
+                        var decryptedText = Encoding.UTF8.GetString(new ReadOnlySpan<byte>(decryptedData, 0, decryptedData.Length - 1));
+                        decryptResultDict[content] = $"<![CDATA[{decryptedText}]]>";//Length - 1是为了移除最后一个空字符
+                        Console.WriteLine($"note {title} decrypted");
                     }
                     catch (Exception e)
                     {
                         Console.WriteLine(e.Message);
-                        continue;
                     }
+                        
                 }
+            });
+            sw.Stop();
+            Console.WriteLine($"{decryptResultDict.Count} notes decrypted,{totalCount} notes in total,{sw.ElapsedMilliseconds}ms passed.");
+            Console.WriteLine("saving notes ...");
+            foreach (var pair in decryptResultDict)
+            {
+                var content = pair.Key;
+                content.RemoveAttribute("encoding");
+                content.InnerXml = pair.Value;
             }
             string savePath = Path.ChangeExtension(path, "enex");
             doc.Save(savePath);
-            Console.WriteLine($"{count} notes decrypted,{totalCount} notes in total");
+            Console.WriteLine("file has been saved to " + savePath);
+            
         }
     }
 }
