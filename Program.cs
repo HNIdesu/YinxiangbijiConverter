@@ -1,5 +1,4 @@
-﻿using System.Collections.Concurrent;
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Xml;
@@ -13,8 +12,11 @@ namespace YinxiangbijiConverter
             aes.BlockSize = 128;
             aes.Key = key;
             return aes.DecryptCbc(data, iv);
+
         }
 
+        private static int mDecryptCount;
+        private static readonly byte[] HmacKey = Encoding.ASCII.GetBytes("{22C58AC3-F1C7-4D96-8B88-5E4BBF505817}");
         private static bool Equals(byte[] data1, byte[] data2)
         {
             int length = data1.Length;
@@ -25,9 +27,29 @@ namespace YinxiangbijiConverter
                     return false;
             return true;
         }
-
-        private static byte[] DecryptNote(byte[] data)
+        
+        private static Task<byte[]> GenerateKeyAsync(byte[] nonce, byte[] hmacKey)
         {
+            return Task.Run(() =>
+            {
+                var key = new byte[16];
+                for (int i = 0; i < 50000; i++)
+                {
+                    nonce = HMACSHA256.HashData(hmacKey, nonce);
+                    for (int j = 0; j < 16; j++)
+                        key[j] ^= nonce[j];
+                }
+                return key;
+            });
+        }
+
+        private async static Task DecryptNoteAsync(XmlElement noteElement)
+        {
+            var title = (noteElement.GetElementsByTagName("title")[0] as XmlElement)?.InnerText;
+            var content = noteElement.GetElementsByTagName("content")[0] as XmlElement;
+            var contentEncoding = content?.GetAttribute("encoding");
+            if (content == null || contentEncoding != "base64:aes") return;
+            var data = Convert.FromBase64String(content.InnerText);
             using var br = new BinaryReader(new MemoryStream(data));
             var signature = Encoding.ASCII.GetString(br.ReadBytes(4));
             if (signature != "ENC0")
@@ -39,31 +61,22 @@ namespace YinxiangbijiConverter
             br.Read(nonce2, 0, 16);
             nonce2[19] = 1;
             var iv = br.ReadBytes(16);
-            var hmacKey = Encoding.ASCII.GetBytes("{22C58AC3-F1C7-4D96-8B88-5E4BBF505817}");
-            var key1 = new byte[16];
-            var key2 = new byte[16];
-            var nonce = nonce1;
-            for (int i = 0; i < 50000; i++)
-            {
-                nonce = HMACSHA256.HashData(hmacKey, nonce);
-                for (int j = 0; j < 16; j++)
-                    key1[j] ^= nonce[j];
-            }
-            nonce = nonce2;
-            for (int i = 0; i < 50000; i++)
-            {
-                nonce = HMACSHA256.HashData(hmacKey, nonce);
-                for (int j = 0; j < 16; j++)
-                    key2[j] ^= nonce[j];
-            }
+            var getKey1Task =  GenerateKeyAsync(nonce1, HmacKey);
+            var getKey2Task =  GenerateKeyAsync(nonce2, HmacKey);
             var encryptedData = br.ReadBytes(data.Length - 4 - 16 * 5);
             var hash = br.ReadBytes(32);
-            if (!Equals(HMACSHA256.HashData(key2, data.SkipLast(32).ToArray()), hash))
+            if (!Equals(HMACSHA256.HashData(await getKey2Task, new ReadOnlySpan<byte>(data, 0, data.Length - 32)), hash))
                 throw new Exception("Hash verify failed");
-            return AesDecrypt(encryptedData, iv, key1);
+            var decryptedData = AesDecrypt(encryptedData, iv, await getKey1Task);
+            var decryptedText = Encoding.UTF8.GetString(new ReadOnlySpan<byte>(decryptedData, 0, decryptedData.Length - 1));
+            content.RemoveAttribute("encoding");
+            content.InnerXml = $"<![CDATA[{decryptedText}]]>";
+            mDecryptCount++;
+            Console.WriteLine($"Note {title} decrypted");
         }
 
-        public static void Main(string[] args)
+
+        public async static Task Main(string[] args)
         {
             if (args.Length == 0)
             {
@@ -72,6 +85,7 @@ namespace YinxiangbijiConverter
                 Console.WriteLine($"Example: {program} test.notes");
                 return;
             }
+            mDecryptCount = 0;
             string path =args[0];
             if (!File.Exists(path))
             {
@@ -80,51 +94,25 @@ namespace YinxiangbijiConverter
             }
             var sw = Stopwatch.StartNew();
             var doc = new XmlDocument();
-            Console.WriteLine("loading " + path);
+            Console.WriteLine("Loading " + path);
             doc.Load(File.OpenRead(path));
             var noteList = doc.DocumentElement?.GetElementsByTagName("note");
             if (noteList == null) return;
             int totalCount = noteList.Count;
             Console.WriteLine($"{totalCount} notes found");
-            var decryptResultDict = new ConcurrentDictionary<XmlElement, string>();
-            Console.WriteLine("starting decryping");
-            Parallel.For(0, totalCount, i =>
+            Console.WriteLine("Starting decryping");
+            var taskList =new Task[totalCount];
+            for(int i = 0; i < totalCount; i++)
             {
-                var note = noteList[i] as XmlElement;
-                var title = (note?.GetElementsByTagName("title")[0] as XmlElement)?.InnerText;
-                var content = note?.GetElementsByTagName("content")[0] as XmlElement;
-                var contentEncoding = content?.GetAttribute("encoding");
-                if (content == null) return;
-                if (contentEncoding == "base64:aes")
-                {
-                    var contentData = Convert.FromBase64String(content.InnerText);
-                    try
-                    {
-                        var decryptedData = DecryptNote(contentData);
-                        var decryptedText = Encoding.UTF8.GetString(new ReadOnlySpan<byte>(decryptedData, 0, decryptedData.Length - 1));
-                        decryptResultDict[content] = $"<![CDATA[{decryptedText}]]>";//Length - 1是为了移除最后一个空字符
-                        Console.WriteLine($"note {title} decrypted");
-                    }
-                    catch (Exception e)
-                    {
-                        Console.WriteLine(e.Message);
-                    }
-                        
-                }
-            });
-            sw.Stop();
-            Console.WriteLine($"{decryptResultDict.Count} notes decrypted,{totalCount} notes in total,{sw.ElapsedMilliseconds}ms passed.");
-            Console.WriteLine("saving notes ...");
-            foreach (var pair in decryptResultDict)
-            {
-                var content = pair.Key;
-                content.RemoveAttribute("encoding");
-                content.InnerXml = pair.Value;
+                var noteElement= (XmlElement)noteList[i]!;
+                taskList[i]=DecryptNoteAsync(noteElement);
             }
+            await Task.WhenAll(taskList);
+            sw.Stop();
+            Console.WriteLine($"{mDecryptCount} notes decrypted,{totalCount} notes in total,{sw.ElapsedMilliseconds}ms passed.");
             string savePath = Path.ChangeExtension(path, "enex");
             doc.Save(savePath);
-            Console.WriteLine("file has been saved to " + savePath);
-            
+            Console.WriteLine("File has been saved to " + savePath);
         }
     }
 }
